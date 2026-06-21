@@ -34,6 +34,12 @@ message. This also "wakes up" the free Render instance if it had spun down.
 - **`bot/telegram.py`** — thin wrapper around the Telegram Bot API.
 - **`bot/handlers.py`** — command parsing and the reply logic for each command.
 - **`.github/workflows/daily-price-check.yml`** — calls `/check-prices` once a day.
+- **`.python-version`** — pins Render's Python version to 3.12. Without this,
+  Render uses whatever its current default is for new services, which can
+  outpace prebuilt wheels for some dependencies (this is what caused the
+  `psycopg2` import crash some deploys hit — its binary wheels lag behind
+  brand-new Python releases). If you ever bump this, make sure
+  `psycopg2-binary` in `requirements.txt` has a matching wheel on PyPI first.
 
 ## Important limitations — please read before relying on this
 
