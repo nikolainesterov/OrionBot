@@ -4,7 +4,7 @@
 # blueprint deploys (Render Dashboard > this service > Environment).
 services:
   - type: web
-    name: amazon-price-bot
+    name: orion-bot
     runtime: python
     plan: free
     buildCommand: "pip install -r requirements.txt"

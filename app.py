@@ -51,7 +51,7 @@ def ensure_db():
 
 @app.get("/")
 def health():
-    return jsonify(status="ok", service="amazon-price-bot")
+    return jsonify(status="ok", service="orion-bot")
 
 
 @app.post("/webhook")
@@ -122,6 +122,26 @@ def check_prices():
     return jsonify(
         total=len(products), checked=checked, dropped=dropped, failed=failed
     )
+
+
+@app.get("/admin/apify-check")
+def admin_apify_check():
+    if not ADMIN_SECRET or request.args.get("token") != ADMIN_SECRET:
+        return jsonify(error="unauthorized"), 401
+
+    apify_token = os.environ.get("APIFY_API_TOKEN", "").strip()
+    if not apify_token:
+        return jsonify(ok=False, error="APIFY_API_TOKEN is not set in environment."), 400
+
+    # Test with a well-known, always-available product (Echo Dot on amazon.com).
+    test_asin = "B08N5WRWNW"
+    test_domain = "amazon.com"
+    try:
+        from bot.amazon import _fetch_via_apify
+        result = _fetch_via_apify(test_asin, test_domain, apify_token)
+        return jsonify(ok=True, result=result)
+    except Exception as exc:
+        return jsonify(ok=False, error=str(exc)), 500
 
 
 @app.get("/admin/db-check")

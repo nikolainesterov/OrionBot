@@ -1,9 +1,9 @@
-# Amazon Price Tracker — Telegram Bot
+# OrionBot — Telegram Bot
 
-A personal Telegram bot that tracks Amazon product prices and messages you
-when they drop. Built with Python (Flask), deployed on Render via webhooks,
-with a free Neon Postgres database for storage and a free GitHub Actions
-cron job to trigger the daily price check.
+A personal Telegram bot, currently with Amazon price tracking. Built with
+Python (Flask), deployed on Render via webhooks, with a free Neon Postgres
+database for storage and a free GitHub Actions cron job for the daily price
+check. Designed to be extended with more commands over time.
 
 ## Commands
 

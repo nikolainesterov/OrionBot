@@ -254,7 +254,7 @@ def _fetch_via_apify(asin: str, domain: str, api_token: str) -> dict:
                 "proxyConfiguration": {"useApifyProxy": True},
             },
             headers={"Authorization": f"Bearer {api_token}"},
-            params={"memory": 256, "timeout": APIFY_RUN_TIMEOUT_S},
+            params={"memory": 128, "timeout": APIFY_RUN_TIMEOUT_S},
             timeout=APIFY_REQUEST_TIMEOUT_S,
         )
     except requests.RequestException as exc:
@@ -333,18 +333,20 @@ def fetch_product_info(asin: str, domain: str = "amazon.com") -> dict:
     Raises AmazonFetchError if all methods fail.
 
     Tries Apify first if APIFY_API_TOKEN is set, then falls back to direct
-    HTML scraping. The fallback rarely succeeds from cloud IPs but is kept
-    so the bot degrades gracefully rather than crashing.
+    HTML scraping. If Apify is configured but fails, that error is surfaced
+    rather than the misleading direct-scraping error.
     """
     apify_token = os.environ.get("APIFY_API_TOKEN", "").strip()
+    apify_error = None
 
     if apify_token:
         try:
             return _fetch_via_apify(asin, domain, apify_token)
-        except AmazonFetchError:
-            # Fall through to direct scraping silently — if Apify is down or
-            # hits a transient error, direct scraping is better than nothing.
-            pass
+        except AmazonFetchError as exc:
+            # Save the real Apify error — if direct scraping also fails we'll
+            # raise this so the user sees the actual problem, not a misleading
+            # "set APIFY_API_TOKEN" message when the token IS set.
+            apify_error = exc
 
     # --- Direct scraping fallback ---
     canonical_url = f"https://www.{domain}/dp/{asin}"
@@ -354,34 +356,21 @@ def fetch_product_info(asin: str, domain: str = "amazon.com") -> dict:
         (canonical_url,                 MOBILE_HEADERS),
     ]
 
-    last_error = AmazonFetchError("All fetch attempts failed.")
     session = requests.Session()
-
     for url, headers in attempts:
         try:
             resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        except requests.RequestException as exc:
-            last_error = AmazonFetchError(f"Network error: {exc}")
+        except requests.RequestException:
             polite_delay(1)
             continue
 
         soup = BeautifulSoup(resp.text, "html.parser")
-
         if _is_blocked_page(soup, resp.status_code):
-            last_error = AmazonFetchError(
-                "Amazon is blocking requests from this server. "
-                "Set APIFY_API_TOKEN to fix this — see the README."
-            )
             polite_delay(1)
             continue
 
         title, price_value, currency = _extract_title_and_price(soup)
-
         if not title:
-            last_error = AmazonFetchError(
-                "Couldn't read the product page (Amazon may be blocking "
-                "this server's IP). Set APIFY_API_TOKEN to fix this."
-            )
             polite_delay(1)
             continue
 
@@ -392,7 +381,13 @@ def fetch_product_info(asin: str, domain: str = "amazon.com") -> dict:
             "url": canonical_url,
         }
 
-    raise last_error
+    # Everything failed. If Apify was configured, its error is more useful.
+    if apify_error:
+        raise AmazonFetchError(f"Apify error: {apify_error}")
+    raise AmazonFetchError(
+        "Couldn't fetch the product. Set APIFY_API_TOKEN to enable "
+        "reliable scraping through Apify — see the README."
+    )
 
 
 def polite_delay(seconds: float = 2.0):
