@@ -1,24 +1,7 @@
-# Database is Neon (https://neon.tech), not a Render Postgres instance —
-# Render's free Postgres expires 30 days after creation, Neon's free tier
-# doesn't. Paste your Neon connection string into DATABASE_URL after this
-# blueprint deploys (Render Dashboard > this service > Environment).
-services:
-  - type: web
-    name: amazon-price-bot
-    runtime: python
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app:app"
-    envVars:
-      - key: DATABASE_URL
-        sync: false
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_USER_ID
-        sync: false
-      - key: TELEGRAM_WEBHOOK_SECRET
-        sync: false
-      - key: CRON_SECRET
-        generateValue: true
-      - key: ADMIN_SECRET
-        generateValue: true
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+*.egg-info/
+.DS_Store

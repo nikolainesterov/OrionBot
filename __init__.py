@@ -1,0 +1,18 @@
+name: Daily Amazon price check
+
+on:
+  schedule:
+    # Runs at 13:00 UTC every day. Edit this to change the time.
+    # (GitHub Actions cron times can drift by a few minutes — that's fine
+    # for a once-a-day check.)
+    - cron: "0 13 * * *"
+  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
+
+jobs:
+  check-prices:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the price-check endpoint
+        run: |
+          curl --fail --show-error --silent \
+            "${{ secrets.RENDER_APP_URL }}/check-prices?token=${{ secrets.CRON_SECRET }}"
