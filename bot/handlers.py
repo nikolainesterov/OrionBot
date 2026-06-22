@@ -51,7 +51,12 @@ def handle_help(chat_id):
 
 def handle_add(chat_id, argument):
     if not argument:
-        return "Usage: /add <amazon product link>"
+        return (
+            "Please send me the Amazon link you want to track:\n\n"
+            "<code>/add https://www.amazon.ca/dp/XXXXXXXXXX</code>\n\n"
+            "You can paste any Amazon product link — full URLs, short "
+            "a.co links, and amazon.ca / amazon.com / amazon.co.uk all work."
+        )
 
     parsed = extract_asin(argument)
     if not parsed:
@@ -111,7 +116,10 @@ def handle_list(chat_id):
 
 def handle_check(chat_id, argument):
     if not argument:
-        return "Usage: /check <number from /list, or ASIN>"
+        return (
+            "Which product do you want to check? Use the number from /list:\n\n"
+            "<code>/check 1</code>"
+        )
 
     product = db.find_product(chat_id, argument)
     if not product:
@@ -134,7 +142,10 @@ def handle_check(chat_id, argument):
 
 def handle_remove(chat_id, argument):
     if not argument:
-        return "Usage: /remove <number from /list, or ASIN>"
+        return (
+            "Which product do you want to remove? Use the number from /list:\n\n"
+            "<code>/remove 1</code>"
+        )
 
     product = db.find_product(chat_id, argument)
     if not product:

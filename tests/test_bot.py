@@ -15,6 +15,11 @@ def test_extract_asin_full_url():
     )
 
 
+def test_extract_asin_no_scheme():
+    """Bare URLs without https:// should still be recognised."""
+    assert extract_asin("amazon.com/dp/B08N5WRWNW") == ("B08N5WRWNW", "amazon.com")
+
+
 def test_extract_asin_with_title_slug():
     url = "https://www.amazon.com/Echo-Dot/dp/B08N5WRWNW/ref=sr_1_3?keywords=echo"
     assert extract_asin(url) == ("B08N5WRWNW", "amazon.com")

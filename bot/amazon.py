@@ -49,11 +49,24 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-CA,en-US;q=0.9,en;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
+    # These Chromium-specific headers are what a real Chrome browser sends.
+    # Amazon uses their presence (and consistency with the User-Agent) as
+    # part of its bot-detection fingerprinting.
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
 }
 
 # Mobile User-Agent as a fallback — Amazon sometimes returns a simpler page
@@ -64,9 +77,18 @@ MOBILE_HEADERS = {
         "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
         "Mobile/15E148 Safari/604.1"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-CA,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
 }
 
 REQUEST_TIMEOUT = 15
@@ -85,6 +107,14 @@ SHORT_LINK_HOSTS = {"amzn.to", "a.co", "amzn.eu", "amzn.asia"}
 
 class AmazonFetchError(Exception):
     """Raised when we can't get a clean product page from Amazon."""
+
+
+def _normalize_url(url: str) -> str:
+    """Add https:// if the URL has no scheme — handles bare links like a.co/d/xxx."""
+    url = url.strip()
+    if url and "://" not in url:
+        url = "https://" + url
+    return url
 
 
 def _looks_like_amazon(url: str) -> bool:
@@ -107,8 +137,12 @@ def extract_asin(url: str):
     """
     Given an Amazon product URL (full or shortened), return (asin, domain).
     Returns None if the URL doesn't look like an Amazon product link.
+    Accepts bare URLs without https:// (e.g. a.co/d/xxx or amazon.com/dp/xxx).
     """
-    if not url or not _looks_like_amazon(url):
+    if not url:
+        return None
+    url = _normalize_url(url)
+    if not _looks_like_amazon(url):
         return None
 
     try:
@@ -199,25 +233,27 @@ def fetch_product_info(asin: str, domain: str = "amazon.com"):
     Returns {"title": str, "price": float|None, "currency": str, "url": str}.
     Raises AmazonFetchError if the page can't be read after all attempts.
 
-    Tries three strategies in order, moving on if a page is blocked or
-    returns no recognisable product title:
-      1. Standard desktop URL + desktop User-Agent
+    Uses a Session so cookies set by Amazon on the first request are sent
+    back on retries (Amazon uses this as part of bot detection). Tries three
+    strategies in order:
+      1. Standard desktop URL + full Chrome headers
       2. Same URL with ?th=1&psc=1 (bypasses some "select a variant" pages)
       3. Same URL with a mobile User-Agent (simpler page structure)
     """
     canonical_url = f"https://www.{domain}/dp/{asin}"
 
     attempts = [
-        (canonical_url,                    HEADERS),
-        (f"{canonical_url}?th=1&psc=1",    HEADERS),
-        (canonical_url,                    MOBILE_HEADERS),
+        (canonical_url,                 HEADERS),
+        (f"{canonical_url}?th=1&psc=1", HEADERS),
+        (canonical_url,                 MOBILE_HEADERS),
     ]
 
     last_error = AmazonFetchError("All fetch attempts failed.")
+    session = requests.Session()
 
     for url, headers in attempts:
         try:
-            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         except requests.RequestException as exc:
             last_error = AmazonFetchError(f"Network error: {exc}")
             polite_delay(1)
