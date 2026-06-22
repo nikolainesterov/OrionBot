@@ -1,24 +1,23 @@
 """
-Handles everything related to talking to Amazon: turning a product URL into
-an ASIN, and fetching the current title/price for that ASIN.
+Handles everything related to Amazon: extracting ASINs from URLs and
+fetching current title/price for a product.
 
-Amazon does not offer a free public API for this kind of casual price
-lookup, so this module scrapes the product page's HTML instead. That means
-it is inherently fragile:
-  - Amazon frequently changes its page markup.
-  - Amazon actively tries to detect and block automated requests, especially
-    from cloud-hosting IP ranges (which is exactly what Render uses). You may
-    see this work fine for a while and then start failing as Amazon's
-    detection updates change, or simply because Render's IP range is flagged.
-  - Amazon may show a CAPTCHA ("Sorry, we just need to make sure you're not
-    a robot") instead of the real page. This module detects that case and
-    raises a clear error rather than silently returning garbage.
+Fetch strategy (in order):
+  1. Apify (https://apify.com) — if APIFY_API_TOKEN is set in the environment,
+     this is used first. Apify runs the request through rotating residential
+     proxies with headless Chrome and built-in CAPTCHA solving, which is why
+     it works reliably from cloud servers where direct scraping is blocked.
+     The free plan ($5/month, no card) covers ~hundreds of lookups/month —
+     far more than a personal bot needs.
 
-If scraping stops working, the fix is almost always to update the CSS
-selectors in PRICE_SELECTORS / TITLE_SELECTORS below to match Amazon's
-current markup (inspect the page in your browser's dev tools).
+  2. Direct HTML scraping — fallback used when APIFY_API_TOKEN is not set or
+     when Apify fails. This is inherently fragile from cloud IPs because
+     Amazon actively blocks automated requests from datacenter IP ranges, but
+     it's kept as a fallback so the bot degrades gracefully rather than
+     failing completely.
 """
 
+import os
 import re
 import time
 from urllib.parse import urlparse
@@ -92,6 +91,16 @@ MOBILE_HEADERS = {
 }
 
 REQUEST_TIMEOUT = 15
+
+# Apify actor for Amazon scraping. If this specific actor is ever deprecated,
+# find a replacement at https://apify.com/store?search=amazon+product
+# The actor ID uses ~ instead of / in API URLs.
+APIFY_ACTOR_ID = "dtrungtin~amazon-scraper"
+# We tell Apify to cap the actor run at 60s, and wait up to 90s total
+# (60s run + network overhead). gunicorn's --timeout in render.yaml must
+# be longer than this so the worker isn't killed mid-request.
+APIFY_RUN_TIMEOUT_S = 60
+APIFY_REQUEST_TIMEOUT_S = 90
 
 ASIN_PATTERNS = [
     re.compile(r"/dp/([A-Z0-9]{10})"),
@@ -227,21 +236,118 @@ def _extract_title_and_price(soup: BeautifulSoup):
     return title, price_value, currency
 
 
-def fetch_product_info(asin: str, domain: str = "amazon.com"):
+def _fetch_via_apify(asin: str, domain: str, api_token: str) -> dict:
+    """
+    Fetch product info via the Apify Amazon scraper Actor.
+    Returns the same dict shape as fetch_product_info on success.
+    Raises AmazonFetchError on any failure so the caller can fall back.
+    """
+    product_url = f"https://www.{domain}/dp/{asin}"
+
+    try:
+        resp = requests.post(
+            f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}"
+            f"/run-sync-get-dataset-items",
+            json={
+                "startUrls": [{"url": product_url}],
+                "maxItems": 1,
+                "proxyConfiguration": {"useApifyProxy": True},
+            },
+            headers={"Authorization": f"Bearer {api_token}"},
+            params={"memory": 256, "timeout": APIFY_RUN_TIMEOUT_S},
+            timeout=APIFY_REQUEST_TIMEOUT_S,
+        )
+    except requests.RequestException as exc:
+        raise AmazonFetchError(f"Apify network error: {exc}") from exc
+
+    if resp.status_code == 401:
+        raise AmazonFetchError(
+            "Apify API token is invalid — check APIFY_API_TOKEN in your environment."
+        )
+    if resp.status_code != 200:
+        raise AmazonFetchError(
+            f"Apify returned HTTP {resp.status_code}: {resp.text[:200]}"
+        )
+
+    try:
+        items = resp.json()
+    except ValueError as exc:
+        raise AmazonFetchError(f"Apify returned invalid JSON: {exc}") from exc
+
+    if not items:
+        raise AmazonFetchError(
+            "Apify found no data for this product — the URL may be invalid "
+            "or the product unavailable."
+        )
+
+    item = items[0]
+
+    # Try several field names since different actor versions vary.
+    title = (
+        item.get("title")
+        or item.get("name")
+        or item.get("productTitle")
+        or item.get("product_title")
+    )
+    if not title:
+        raise AmazonFetchError(
+            "Apify returned a result but with no product title. "
+            "The actor output format may have changed — check the Apify Store "
+            f"for actor '{APIFY_ACTOR_ID}'."
+        )
+
+    # Price can be a float/int or a string like "$19.99" / "CA$29.99".
+    price_value, currency = None, "$"
+    raw_price = (
+        item.get("price")
+        or item.get("currentPrice")
+        or item.get("salePrice")
+        or item.get("priceWithCurrency")
+    )
+    if isinstance(raw_price, (int, float)):
+        price_value = round(float(raw_price), 2)
+    elif isinstance(raw_price, str) and raw_price:
+        price_value, currency = _parse_price_text(raw_price)
+
+    # Currency can be a symbol ("$", "CA$") or an ISO code ("USD", "CAD").
+    raw_currency = (
+        item.get("currency")
+        or item.get("currencyCode")
+        or item.get("currencySymbol")
+    )
+    if raw_currency:
+        currency = raw_currency
+
+    return {
+        "title": title.strip(),
+        "price": price_value,
+        "currency": currency or "$",
+        "url": product_url,
+    }
+
+
+def fetch_product_info(asin: str, domain: str = "amazon.com") -> dict:
     """
     Fetch the current title and price for a product.
     Returns {"title": str, "price": float|None, "currency": str, "url": str}.
-    Raises AmazonFetchError if the page can't be read after all attempts.
+    Raises AmazonFetchError if all methods fail.
 
-    Uses a Session so cookies set by Amazon on the first request are sent
-    back on retries (Amazon uses this as part of bot detection). Tries three
-    strategies in order:
-      1. Standard desktop URL + full Chrome headers
-      2. Same URL with ?th=1&psc=1 (bypasses some "select a variant" pages)
-      3. Same URL with a mobile User-Agent (simpler page structure)
+    Tries Apify first if APIFY_API_TOKEN is set, then falls back to direct
+    HTML scraping. The fallback rarely succeeds from cloud IPs but is kept
+    so the bot degrades gracefully rather than crashing.
     """
-    canonical_url = f"https://www.{domain}/dp/{asin}"
+    apify_token = os.environ.get("APIFY_API_TOKEN", "").strip()
 
+    if apify_token:
+        try:
+            return _fetch_via_apify(asin, domain, apify_token)
+        except AmazonFetchError:
+            # Fall through to direct scraping silently — if Apify is down or
+            # hits a transient error, direct scraping is better than nothing.
+            pass
+
+    # --- Direct scraping fallback ---
+    canonical_url = f"https://www.{domain}/dp/{asin}"
     attempts = [
         (canonical_url,                 HEADERS),
         (f"{canonical_url}?th=1&psc=1", HEADERS),
@@ -264,7 +370,7 @@ def fetch_product_info(asin: str, domain: str = "amazon.com"):
         if _is_blocked_page(soup, resp.status_code):
             last_error = AmazonFetchError(
                 "Amazon is blocking requests from this server. "
-                "The price will be retried on the next daily check."
+                "Set APIFY_API_TOKEN to fix this — see the README."
             )
             polite_delay(1)
             continue
@@ -274,12 +380,11 @@ def fetch_product_info(asin: str, domain: str = "amazon.com"):
         if not title:
             last_error = AmazonFetchError(
                 "Couldn't read the product page (Amazon may be blocking "
-                "this server's IP, or the page layout has changed)."
+                "this server's IP). Set APIFY_API_TOKEN to fix this."
             )
             polite_delay(1)
             continue
 
-        # Success — return the canonical URL regardless of which attempt worked.
         return {
             "title": title,
             "price": price_value,
