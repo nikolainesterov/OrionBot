@@ -108,15 +108,32 @@ git push -u origin main
 
 **Option A — Blueprint (recommended):**
 
+Before deploying, generate three secrets now by running this in your
+terminal (each command gives you one value to copy):
+
+```bash
+python3 -c "import secrets; print(secrets.token_hex(32))"   # TELEGRAM_WEBHOOK_SECRET
+python3 -c "import secrets; print(secrets.token_hex(32))"   # CRON_SECRET
+python3 -c "import secrets; print(secrets.token_hex(32))"   # ADMIN_SECRET
+```
+
+`token_hex` produces hex strings (only `0-9` and `a-f`) which are safe
+everywhere: in URLs, in Telegram's API, and in environment variables.
+**Do not use base64 or random-password generators** for these — many produce
+`/`, `+`, and `=` characters that break Telegram's webhook API.
+
+**Option A — Blueprint (recommended):**
+
 1. In the [Render Dashboard](https://dashboard.render.com), click
    **New > Blueprint** and select your GitHub repo. Render will read
    `render.yaml` and propose a single free web service.
-2. When prompted, fill in:
+2. When prompted, fill in all five environment variables:
    - `TELEGRAM_BOT_TOKEN` — from BotFather
    - `TELEGRAM_USER_ID` — your numeric Telegram ID
    - `DATABASE_URL` — the Neon connection string from step 2
-   - `TELEGRAM_WEBHOOK_SECRET`, `CRON_SECRET`, `ADMIN_SECRET` are generated
-     automatically.
+   - `TELEGRAM_WEBHOOK_SECRET` — the first hex string you generated above
+   - `CRON_SECRET` — the second hex string
+   - `ADMIN_SECRET` — the third hex string
 3. Click **Apply**.
 
 **Option B — Manual setup:**
@@ -125,13 +142,7 @@ git push -u origin main
    - Build command: `pip install -r requirements.txt`
    - Start command: `gunicorn app:app`
    - Plan: Free
-2. Under **Environment**, add:
-   - `TELEGRAM_BOT_TOKEN` — from BotFather
-   - `TELEGRAM_USER_ID` — your numeric Telegram ID
-   - `DATABASE_URL` — the Neon connection string from step 2
-   - `TELEGRAM_WEBHOOK_SECRET`, `CRON_SECRET`, `ADMIN_SECRET` — each a
-     random string, e.g. generate with:
-     `python3 -c "import secrets; print(secrets.token_hex(24))"`
+2. Under **Environment**, add all six variables listed in Option A step 2.
 3. Deploy.
 
 ### 5. Register the webhook with Telegram
@@ -152,6 +163,24 @@ To double check it worked:
 ```
 https://<your-app>.onrender.com/admin/webhook-info?token=<your ADMIN_SECRET>
 ```
+
+**If a page just spins forever ("Application loading...") and never
+responds:** that's not a normal free-tier cold start (those resolve in well
+under a minute). It almost always means `DATABASE_URL` is wrong or
+unreachable — check it first with:
+
+```
+https://<your-app>.onrender.com/admin/db-check?token=<your ADMIN_SECRET>
+```
+
+This endpoint tries a real database connection with a 10-second timeout and
+returns a clear error message instead of hanging — e.g. wrong host, wrong
+password, or missing `sslmode=require`. Compare whatever it reports against
+the connection string on your Neon project's Dashboard tab. (`/admin/set-webhook`
+and `/admin/webhook-info` never touch the database at all, so they should
+respond quickly regardless of whether your database is configured
+correctly — if those also hang, the problem is elsewhere, e.g. the service
+itself failing to start; check the Render logs.)
 
 ### 6. Set up the daily check (GitHub Actions)
 

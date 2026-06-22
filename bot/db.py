@@ -25,7 +25,10 @@ def _connection_string():
 
 @contextmanager
 def get_conn():
-    conn = psycopg2.connect(_connection_string())
+    # connect_timeout is critical here: without it, a wrong or unreachable
+    # DATABASE_URL can hang the connection attempt for minutes instead of
+    # failing quickly with a clear error.
+    conn = psycopg2.connect(_connection_string(), connect_timeout=10)
     try:
         yield conn
         conn.commit()

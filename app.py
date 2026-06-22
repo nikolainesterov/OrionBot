@@ -43,9 +43,10 @@ def ensure_db():
         _db_ready = True
 
 
-@app.before_request
-def _init():
-    ensure_db()
+# NOTE: deliberately not a @app.before_request hook. That used to run on
+# every single request — including /admin/* routes that don't touch the
+# database — so a bad DATABASE_URL would hang admin/health requests too.
+# Instead, only the two routes that actually need the database call this.
 
 
 @app.get("/")
@@ -61,6 +62,7 @@ def webhook():
     if not TELEGRAM_WEBHOOK_SECRET or incoming_secret != TELEGRAM_WEBHOOK_SECRET:
         return jsonify(error="unauthorized"), 401
 
+    ensure_db()
     update = request.get_json(silent=True) or {}
     reply_text = handle_update(update, allowed_chat_id=ALLOWED_CHAT_ID)
 
@@ -78,6 +80,7 @@ def check_prices():
     if not CRON_SECRET or request.args.get("token") != CRON_SECRET:
         return jsonify(error="unauthorized"), 401
 
+    ensure_db()
     products = db.get_all_products()
     checked, dropped, failed = 0, 0, 0
 
@@ -121,6 +124,21 @@ def check_prices():
     )
 
 
+@app.get("/admin/db-check")
+def admin_db_check():
+    if not ADMIN_SECRET or request.args.get("token") != ADMIN_SECRET:
+        return jsonify(error="unauthorized"), 401
+
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        return jsonify(ok=True, message="Database connection succeeded.")
+    except Exception as exc:  # noqa: BLE001 — surface any DB error to the caller
+        return jsonify(ok=False, error=str(exc)), 500
+
+
 @app.get("/admin/set-webhook")
 def admin_set_webhook():
     if not ADMIN_SECRET or request.args.get("token") != ADMIN_SECRET:
@@ -128,8 +146,13 @@ def admin_set_webhook():
 
     base_url = os.environ.get("RENDER_EXTERNAL_URL") or request.url_root.rstrip("/")
     webhook_url = f"{base_url}/webhook"
-    result = telegram.set_webhook(webhook_url, TELEGRAM_WEBHOOK_SECRET)
-    return jsonify(webhook_url=webhook_url, telegram_response=result)
+    webhook_result = telegram.set_webhook(webhook_url, TELEGRAM_WEBHOOK_SECRET)
+    commands_result = telegram.set_my_commands()
+    return jsonify(
+        webhook_url=webhook_url,
+        webhook=webhook_result,
+        commands=commands_result,
+    )
 
 
 @app.get("/admin/webhook-info")

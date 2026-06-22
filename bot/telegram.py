@@ -55,3 +55,23 @@ def delete_webhook():
 def get_webhook_info():
     resp = requests.get(_api_url("getWebhookInfo"), timeout=REQUEST_TIMEOUT)
     return resp.json()
+
+
+# The list of commands shown in Telegram's command menu (the / button next
+# to the message input). Keep these in sync with the handlers in handlers.py.
+BOT_COMMANDS = [
+    {"command": "add",    "description": "Track a new Amazon product (paste a link)"},
+    {"command": "list",   "description": "Show all your tracked products"},
+    {"command": "check",  "description": "Check a product's price right now"},
+    {"command": "remove", "description": "Stop tracking a product"},
+    {"command": "help",   "description": "Show all commands"},
+]
+
+
+def set_my_commands():
+    resp = requests.post(
+        _api_url("setMyCommands"),
+        json={"commands": BOT_COMMANDS},
+        timeout=REQUEST_TIMEOUT,
+    )
+    return resp.json()

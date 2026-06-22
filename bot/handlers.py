@@ -67,8 +67,12 @@ def handle_add(chat_id, argument):
         # Still track it even if we couldn't get a price yet — better than
         # making the user re-paste the link. We'll pick up the price on the
         # next daily check.
+        # Use the canonical Amazon URL (built from ASIN+domain), NOT the
+        # original argument — which could be an a.co short link that would
+        # show up as the title in /list.
+        canonical_url = f"https://www.{domain}/dp/{asin}"
         added = db.add_product(
-            chat_id, asin, domain, argument, title=f"Product {asin}",
+            chat_id, asin, domain, canonical_url, title=f"Product {asin}",
             price=None, currency="$",
         )
         if not added:

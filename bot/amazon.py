@@ -56,6 +56,19 @@ HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
+# Mobile User-Agent as a fallback — Amazon sometimes returns a simpler page
+# structure for mobile clients that is easier to parse.
+MOBILE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+        "Mobile/15E148 Safari/604.1"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
+
 REQUEST_TIMEOUT = 15
 
 ASIN_PATTERNS = [
@@ -153,43 +166,21 @@ def _is_blocked_page(soup: BeautifulSoup, status_code: int) -> bool:
         "to discuss automated access to amazon data",
         "enter the characters you see below",
         "sorry, we just need to make sure you're not a robot",
+        "robot check",
+        "verify your identity",
+        "sign in for the best experience",
     ]
     return any(marker in text for marker in blocked_markers)
 
 
-def fetch_product_info(asin: str, domain: str = "amazon.com"):
-    """
-    Fetch the current title and price for a product.
-    Returns {"title": str, "price": float|None, "currency": str, "url": str}.
-    Raises AmazonFetchError if the page can't be read (blocked, not found, etc).
-    """
-    url = f"https://www.{domain}/dp/{asin}"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as exc:
-        raise AmazonFetchError(f"Network error fetching {url}: {exc}") from exc
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    if _is_blocked_page(soup, resp.status_code):
-        raise AmazonFetchError(
-            "Amazon blocked this request (CAPTCHA or rate limit). "
-            "Try again later."
-        )
-
+def _extract_title_and_price(soup: BeautifulSoup):
+    """Return (title, price, currency) from a parsed page, or (None, None, None)."""
     title_el = None
     for selector in TITLE_SELECTORS:
         title_el = soup.select_one(selector)
         if title_el:
             break
     title = title_el.get_text(strip=True) if title_el else None
-
-    if not title:
-        raise AmazonFetchError(
-            "Couldn't find a product title on that page. The link may be "
-            "invalid, the product may be unavailable, or Amazon's page "
-            "layout has changed."
-        )
 
     price_value, currency = None, "$"
     for selector in PRICE_SELECTORS:
@@ -199,12 +190,68 @@ def fetch_product_info(asin: str, domain: str = "amazon.com"):
             if price_value is not None:
                 break
 
-    return {
-        "title": title,
-        "price": price_value,
-        "currency": currency or "$",
-        "url": url,
-    }
+    return title, price_value, currency
+
+
+def fetch_product_info(asin: str, domain: str = "amazon.com"):
+    """
+    Fetch the current title and price for a product.
+    Returns {"title": str, "price": float|None, "currency": str, "url": str}.
+    Raises AmazonFetchError if the page can't be read after all attempts.
+
+    Tries three strategies in order, moving on if a page is blocked or
+    returns no recognisable product title:
+      1. Standard desktop URL + desktop User-Agent
+      2. Same URL with ?th=1&psc=1 (bypasses some "select a variant" pages)
+      3. Same URL with a mobile User-Agent (simpler page structure)
+    """
+    canonical_url = f"https://www.{domain}/dp/{asin}"
+
+    attempts = [
+        (canonical_url,                    HEADERS),
+        (f"{canonical_url}?th=1&psc=1",    HEADERS),
+        (canonical_url,                    MOBILE_HEADERS),
+    ]
+
+    last_error = AmazonFetchError("All fetch attempts failed.")
+
+    for url, headers in attempts:
+        try:
+            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as exc:
+            last_error = AmazonFetchError(f"Network error: {exc}")
+            polite_delay(1)
+            continue
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        if _is_blocked_page(soup, resp.status_code):
+            last_error = AmazonFetchError(
+                "Amazon is blocking requests from this server. "
+                "The price will be retried on the next daily check."
+            )
+            polite_delay(1)
+            continue
+
+        title, price_value, currency = _extract_title_and_price(soup)
+
+        if not title:
+            last_error = AmazonFetchError(
+                "Couldn't read the product page (Amazon may be blocking "
+                "this server's IP, or the page layout has changed)."
+            )
+            polite_delay(1)
+            continue
+
+        # Success — return the canonical URL regardless of which attempt worked.
+        return {
+            "title": title,
+            "price": price_value,
+            "currency": currency or "$",
+            "url": canonical_url,
+        }
+
+    raise last_error
 
 
 def polite_delay(seconds: float = 2.0):

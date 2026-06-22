@@ -17,7 +17,7 @@ services:
       - key: TELEGRAM_USER_ID
         sync: false
       - key: TELEGRAM_WEBHOOK_SECRET
-        generateValue: true
+        sync: false
       - key: CRON_SECRET
         generateValue: true
       - key: ADMIN_SECRET
