@@ -100,25 +100,20 @@ def webhook():
     return jsonify(ok=True)
 
 
-@app.route("/check-prices", methods=["GET", "POST"])
-def check_prices():
-    if not CRON_SECRET or request.args.get("token") != CRON_SECRET:
-        return jsonify(error="unauthorized"), 401
-
-    ensure_db()
-    products = db.get_all_products()
-    checked, dropped, failed = 0, 0, 0
-
+def _run_price_check(products):
+    """
+    Background thread for the daily price check. Runs after /check-prices
+    has already returned 200 to the caller, so Render's HTTP timeout can't
+    interrupt it.
+    """
     for product in products:
         try:
             info = fetch_product_info(product["asin"], product["domain"])
         except AmazonFetchError:
             db.touch_checked(product["id"])
-            failed += 1
             polite_delay()
             continue
 
-        checked += 1
         new_price = info["price"]
         old_price = product["last_price"]
 
@@ -127,12 +122,12 @@ def check_prices():
             and old_price is not None
             and float(new_price) < float(old_price)
         ):
-            dropped += 1
             telegram.send_message(
                 product["chat_id"],
                 (
                     f"📉 Price drop! <b>{info['title']}</b>\n"
-                    f"{info['currency']}{old_price} → {info['currency']}{new_price}\n"
+                    f"{info['currency']}{old_price} → "
+                    f"{info['currency']}{new_price}\n"
                     f"{product['url']}"
                 ),
             )
@@ -142,10 +137,35 @@ def check_prices():
         else:
             db.touch_checked(product["id"])
 
-        polite_delay()  # be gentle with Amazon between requests
+        polite_delay()
+
+
+@app.route("/check-prices", methods=["GET", "POST"])
+def check_prices():
+    if not CRON_SECRET or request.args.get("token") != CRON_SECRET:
+        return jsonify(error="unauthorized"), 401
+
+    ensure_db()
+    products = db.get_all_products()
+
+    if not products:
+        return jsonify(ok=True, message="No products tracked yet.", total=0)
+
+    # Return 200 immediately — Render's load balancer closes HTTP connections
+    # that don't get a response within ~30 seconds, and checking several
+    # products takes longer than that. The actual work runs in a background
+    # thread and sends Telegram messages when prices drop.
+    thread = threading.Thread(
+        target=_run_price_check,
+        args=(products,),
+        daemon=True,
+    )
+    thread.start()
 
     return jsonify(
-        total=len(products), checked=checked, dropped=dropped, failed=failed
+        ok=True,
+        message=f"Price check started for {len(products)} product(s).",
+        total=len(products),
     )
 
 
