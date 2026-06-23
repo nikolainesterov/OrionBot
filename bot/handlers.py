@@ -131,11 +131,19 @@ def handle_check(chat_id, argument):
         db.touch_checked(product["id"])
         return f"Couldn't fetch the price right now: {exc}"
 
-    db.update_price(product["id"], info["price"])
+    if info["price"] is not None:
+        db.update_price(product["id"], info["price"])
+    else:
+        db.touch_checked(product["id"])
+
+    # Also fix the title if it was stored as "Product XXXXXX" from a failed add
+    if info["title"] and (not product["title"] or product["title"].startswith("Product ")):
+        db.update_title(product["id"], info["title"])
+
     price_text = (
         f"{info['currency']}{info['price']}"
         if info["price"] is not None
-        else "price unknown"
+        else "price unknown — Amazon may not be showing a public price for this item"
     )
     return f"<b>{info['title']}</b>\nCurrent price: {price_text}"
 
