@@ -1,23 +1,19 @@
 """
 Flask app with two jobs:
 
-1. POST /webhook — Telegram sends every message here. Render's free web
-   service spins up on request, so a Telegram message effectively "wakes
-   the bot up". Protected by the Telegram secret-token header (set via
-   set_webhook.py), not by anything in the URL.
+1. POST /webhook — Telegram sends every message here. The handler returns
+   200 immediately for every request. Commands that call Apify (/add, /check)
+   are dispatched to a background thread so the webhook never times out —
+   Apify takes ~40 seconds and gunicorn's worker timeout would kill a
+   synchronous handler long before that.
 
 2. GET/POST /check-prices — re-checks every tracked product and DMs anyone
-   whose price dropped. Nothing on Render's free tier calls this on a
-   schedule for free, so a GitHub Actions workflow
-   (.github/workflows/daily-price-check.yml) hits this endpoint once a day.
+   whose price dropped. A GitHub Actions workflow hits this once a day.
    Protected by a shared-secret query parameter (CRON_SECRET).
-
-Also exposes a couple of small admin helpers (/admin/set-webhook,
-/admin/webhook-info) so you don't need to write a separate script to
-register the webhook with Telegram after each deploy.
 """
 
 import os
+import threading
 import time
 
 from flask import Flask, jsonify, request
@@ -31,7 +27,7 @@ app = Flask(__name__)
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
-ALLOWED_CHAT_ID = os.environ.get("TELEGRAM_USER_ID")  # optional but recommended
+ALLOWED_CHAT_ID = os.environ.get("TELEGRAM_USER_ID")
 
 _db_ready = False
 
@@ -43,10 +39,21 @@ def ensure_db():
         _db_ready = True
 
 
-# NOTE: deliberately not a @app.before_request hook. That used to run on
-# every single request — including /admin/* routes that don't touch the
-# database — so a bad DATABASE_URL would hang admin/health requests too.
-# Instead, only the two routes that actually need the database call this.
+def _run_in_background(chat_id, update):
+    """
+    Called in a daemon thread for slow commands (/add, /check).
+    Runs handle_update and sends the result when it's ready — regardless of
+    how long Apify takes. The webhook handler has already returned 200 by
+    the time this runs.
+    """
+    try:
+        reply_text = handle_update(update, allowed_chat_id=ALLOWED_CHAT_ID)
+        if reply_text and chat_id is not None:
+            telegram.send_message(chat_id, reply_text)
+    except Exception:
+        # Best effort — if something crashes in the thread, don't let it
+        # propagate silently. Could add logging here in future.
+        pass
 
 
 @app.get("/")
@@ -56,22 +63,40 @@ def health():
 
 @app.post("/webhook")
 def webhook():
-    # Telegram includes this header on every webhook request when a
-    # secret_token was set via setWebhook — reject anything else.
     incoming_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if not TELEGRAM_WEBHOOK_SECRET or incoming_secret != TELEGRAM_WEBHOOK_SECRET:
         return jsonify(error="unauthorized"), 401
 
     ensure_db()
     update = request.get_json(silent=True) or {}
+    message = update.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    text = (message.get("text") or "").strip()
+
+    # Detect slow commands (/add and /check with an argument both call Apify
+    # and take ~40 seconds). For these, send an immediate "please wait" ack
+    # and dispatch the real work to a background thread, then return 200 right
+    # away. This prevents gunicorn worker timeouts and Telegram's retry loop.
+    if text and chat_id:
+        parts = text.split(maxsplit=1)
+        cmd = parts[0].lower().lstrip("/").split("@")[0]
+        has_arg = len(parts) > 1
+
+        if cmd in ("add", "check") and has_arg:
+            telegram.send_message(chat_id, "⏳ Checking Amazon, please wait...")
+            thread = threading.Thread(
+                target=_run_in_background,
+                args=(chat_id, update),
+                daemon=True,
+            )
+            thread.start()
+            return jsonify(ok=True)  # Return immediately — thread handles the rest
+
+    # Fast commands (/list, /remove, /help, /start, and bare /add or /check
+    # with no argument) are handled synchronously — they don't call Apify.
     reply_text = handle_update(update, allowed_chat_id=ALLOWED_CHAT_ID)
-
-    if reply_text:
-        message = update.get("message", {})
-        chat_id = message.get("chat", {}).get("id")
-        if chat_id is not None:
-            telegram.send_message(chat_id, reply_text)
-
+    if reply_text and chat_id is not None:
+        telegram.send_message(chat_id, reply_text)
     return jsonify(ok=True)
 
 
