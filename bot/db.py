@@ -155,6 +155,16 @@ def touch_checked(product_id):
             )
 
 
+def update_title(product_id, title):
+    """Fix a placeholder title once we successfully fetch the real one."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE products SET title = %s WHERE id = %s",
+                (title, product_id),
+            )
+
+
 def get_all_products():
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
