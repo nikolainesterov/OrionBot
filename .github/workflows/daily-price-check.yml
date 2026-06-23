@@ -2,9 +2,8 @@ name: Daily Amazon price check
 
 on:
   schedule:
-    # Runs at 13:00 UTC every day. Edit this to change the time.
-    # (GitHub Actions cron times can drift by a few minutes — that's fine
-    # for a once-a-day check.)
+    # Runs at 13:00 UTC every day (7:00 AM Saskatoon time).
+    # Edit minute/hour to change the time. Format: "minute hour * * *" in UTC.
     - cron: "0 13 * * *"
   workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
 
@@ -12,7 +11,18 @@ jobs:
   check-prices:
     runs-on: ubuntu-latest
     steps:
-      - name: Call the price-check endpoint
+      - name: Wake up the Render service
+        # Free Render services sleep after inactivity. This step pings the
+        # health endpoint and waits up to 90 seconds for it to wake up.
+        # We use || true so the job doesn't fail if the ping itself times out.
         run: |
-          curl --fail --show-error --silent --max-time 180 \
+          curl --silent --max-time 90 "${{ secrets.RENDER_APP_URL }}/" || true
+          sleep 5
+
+      - name: Trigger price check
+        # The /check-prices endpoint returns 200 immediately and runs the
+        # actual check in a background thread, so this step completes in
+        # under a second. Price drop alerts arrive via Telegram.
+        run: |
+          curl --fail --show-error --max-time 30 \
             "${{ secrets.RENDER_APP_URL }}/check-prices?token=${{ secrets.CRON_SECRET }}"
