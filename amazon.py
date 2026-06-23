@@ -1,322 +1,234 @@
 """
-Handles Amazon URL parsing and product price/title fetching.
+Flask app with two jobs:
 
-Fetch strategy (in order):
-  1. Apify Proxy — if APIFY_API_TOKEN is set, routes our requests through
-     Apify's proxy network (country-specific datacenter IPs) so Amazon
-     doesn't block us as a cloud server. We use our own BeautifulSoup
-     parsing, NOT an Apify actor. This avoids the 30-40s actor startup time
-     and the title/price extraction bugs in third-party actors.
+1. POST /webhook — Telegram sends every message here. The handler returns
+   200 immediately for every request. Commands that call Apify (/add, /check)
+   are dispatched to a background thread so the webhook never times out —
+   Apify takes ~40 seconds and gunicorn's worker timeout would kill a
+   synchronous handler long before that.
 
-  2. Direct scraping — fallback with no proxy. Unreliable from cloud IPs
-     (Amazon blocks them) but kept as a last resort.
-
-Why proxy instead of actor?
-  The dtrungtin~amazon-scraper actor consistently returns empty title/price
-  for amazon.ca because Amazon Canada shows a postal-code prompt that hides
-  product content before the actor's selectors run. Using the proxy directly
-  lets us control the full request — headers, retries, parsing — and we can
-  handle the location prompt ourselves.
+2. GET/POST /check-prices — re-checks every tracked product and DMs anyone
+   whose price dropped. A GitHub Actions workflow hits this once a day.
+   Protected by a shared-secret query parameter (CRON_SECRET).
 """
 
 import os
-import re
+import threading
 import time
-from urllib.parse import urlparse
 
-import requests
-from bs4 import BeautifulSoup
+from flask import Flask, jsonify, request
 
-PRICE_SELECTORS = [
-    "span.a-price span.a-offscreen",
-    "#corePrice_feature_div span.a-offscreen",
-    "#corePriceDisplay_desktop_feature_div span.a-offscreen",
-    "#priceblock_ourprice",
-    "#priceblock_dealprice",
-    "#tp_price_block_total_price_ww span.a-offscreen",
-]
+from bot import db, telegram
+from bot.amazon import AmazonFetchError, fetch_product_info, polite_delay
+from bot.handlers import handle_update
 
-TITLE_SELECTORS = [
-    "#productTitle",
-    "#title span#productTitle",
-]
+app = Flask(__name__)
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,image/apng,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-CA,en-US;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-}
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+CRON_SECRET = os.environ.get("CRON_SECRET", "")
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
+ALLOWED_CHAT_ID = os.environ.get("TELEGRAM_USER_ID")
 
-MOBILE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-        "Mobile/15E148 Safari/604.1"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-CA,en-US;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-}
-
-REQUEST_TIMEOUT = 12  # seconds per individual attempt — kept short because
-                      # fetch_product_info tries up to 8 attempts total, so
-                      # a 30s timeout would mean 4 minutes of waiting on failures.
-
-# Apify proxy — datacenter IPs routed by country code.
-# Docs: https://docs.apify.com/platform/proxy/connection-settings
-APIFY_PROXY_HOST = "proxy.apify.com"
-APIFY_PROXY_PORT = 8000
-
-ASIN_PATTERNS = [
-    re.compile(r"/dp/([A-Z0-9]{10})"),
-    re.compile(r"/gp/product/([A-Z0-9]{10})"),
-    re.compile(r"/gp/aw/d/([A-Z0-9]{10})"),
-    re.compile(r"/product/([A-Z0-9]{10})"),
-    re.compile(r"[?&]asin=([A-Z0-9]{10})", re.IGNORECASE),
-]
-
-SHORT_LINK_HOSTS = {"amzn.to", "a.co", "amzn.eu", "amzn.asia"}
+_db_ready = False
 
 
-class AmazonFetchError(Exception):
-    """Raised when we can't get a clean product page from Amazon."""
+def ensure_db():
+    global _db_ready
+    if not _db_ready:
+        db.init_db()
+        _db_ready = True
 
 
-def _normalize_url(url: str) -> str:
-    """Add https:// if the URL has no scheme (handles bare a.co/d/xxx links)."""
-    url = url.strip()
-    if url and "://" not in url:
-        url = "https://" + url
-    return url
-
-
-def _looks_like_amazon(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
-    return "amazon." in host or host in SHORT_LINK_HOSTS
-
-
-def _domain_to_country_code(domain: str) -> str:
-    mapping = {
-        "amazon.ca":     "CA",
-        "amazon.co.uk":  "GB",
-        "amazon.com.au": "AU",
-        "amazon.de":     "DE",
-        "amazon.fr":     "FR",
-        "amazon.it":     "IT",
-        "amazon.es":     "ES",
-        "amazon.co.jp":  "JP",
-        "amazon.com.mx": "MX",
-        "amazon.in":     "IN",
-        "amazon.nl":     "NL",
-        "amazon.se":     "SE",
-        "amazon.pl":     "PL",
-    }
-    return mapping.get(domain, "US")
-
-
-def resolve_short_link(url: str) -> str:
-    host = urlparse(url).netloc.lower()
-    if host not in SHORT_LINK_HOSTS:
-        return url
-    resp = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
-    return resp.url
-
-
-def extract_asin(url: str):
+def _run_in_background(chat_id, update):
     """
-    Return (asin, domain) from any Amazon link, or None.
-    Accepts bare URLs (a.co/d/xxx), short links, and full URLs.
+    Called in a daemon thread for slow commands (/add, /check).
+    Runs handle_update and sends the result when it's ready — regardless of
+    how long Apify takes. The webhook handler has already returned 200 by
+    the time this runs.
     """
-    if not url:
-        return None
-    url = _normalize_url(url)
-    if not _looks_like_amazon(url):
-        return None
     try:
-        url = resolve_short_link(url)
-    except requests.RequestException:
-        return None
-    parsed = urlparse(url)
-    domain = parsed.netloc.lower().replace("www.", "")
-    for pattern in ASIN_PATTERNS:
-        match = pattern.search(parsed.path) or pattern.search(url)
-        if match:
-            return match.group(1).upper(), domain
-    return None
+        reply_text = handle_update(update, allowed_chat_id=ALLOWED_CHAT_ID)
+        if reply_text and chat_id is not None:
+            telegram.send_message(chat_id, reply_text)
+    except Exception:
+        # Best effort — if something crashes in the thread, don't let it
+        # propagate silently. Could add logging here in future.
+        pass
 
 
-def _parse_price_text(text: str):
-    """Turn '$19.99', 'CA$29.99', '£12.99' etc. into (float, symbol)."""
-    if not text:
-        return None, None
-    text = text.strip()
-    m = re.match(r"^([^\d]*)([\d.,]+)", text)
-    if not m:
-        return None, None
-    symbol = m.group(1).strip() or "$"
-    number = m.group(2)
-    if "," in number and "." in number:
-        if number.rfind(",") > number.rfind("."):
-            number = number.replace(".", "").replace(",", ".")
+@app.get("/")
+def health():
+    return jsonify(status="ok", service="orion-bot")
+
+
+@app.post("/webhook")
+def webhook():
+    incoming_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not TELEGRAM_WEBHOOK_SECRET or incoming_secret != TELEGRAM_WEBHOOK_SECRET:
+        return jsonify(error="unauthorized"), 401
+
+    ensure_db()
+    update = request.get_json(silent=True) or {}
+    message = update.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    text = (message.get("text") or "").strip()
+
+    # Detect slow commands (/add and /check with an argument both call Apify
+    # and take ~40 seconds). For these, send an immediate "please wait" ack
+    # and dispatch the real work to a background thread, then return 200 right
+    # away. This prevents gunicorn worker timeouts and Telegram's retry loop.
+    if text and chat_id:
+        parts = text.split(maxsplit=1)
+        cmd = parts[0].lower().lstrip("/").split("@")[0]
+        has_arg = len(parts) > 1
+
+        if cmd in ("add", "check") and has_arg:
+            telegram.send_message(chat_id, "⏳ Checking Amazon, please wait...")
+            thread = threading.Thread(
+                target=_run_in_background,
+                args=(chat_id, update),
+                daemon=True,
+            )
+            thread.start()
+            return jsonify(ok=True)  # Return immediately — thread handles the rest
+
+    # Fast commands (/list, /remove, /help, /start, and bare /add or /check
+    # with no argument) are handled synchronously — they don't call Apify.
+    reply_text = handle_update(update, allowed_chat_id=ALLOWED_CHAT_ID)
+    if reply_text and chat_id is not None:
+        telegram.send_message(chat_id, reply_text)
+    return jsonify(ok=True)
+
+
+def _run_price_check(products):
+    """
+    Background thread for the daily price check. Runs after /check-prices
+    has already returned 200 to the caller, so Render's HTTP timeout can't
+    interrupt it.
+    """
+    for product in products:
+        try:
+            info = fetch_product_info(product["asin"], product["domain"])
+        except AmazonFetchError:
+            db.touch_checked(product["id"])
+            polite_delay()
+            continue
+
+        new_price = info["price"]
+        old_price = product["last_price"]
+
+        if (
+            new_price is not None
+            and old_price is not None
+            and float(new_price) < float(old_price)
+        ):
+            telegram.send_message(
+                product["chat_id"],
+                (
+                    f"📉 Price drop! <b>{info['title']}</b>\n"
+                    f"{info['currency']}{old_price} → "
+                    f"{info['currency']}{new_price}\n"
+                    f"{product['url']}"
+                ),
+            )
+
+        if new_price is not None:
+            db.update_price(product["id"], new_price)
         else:
-            number = number.replace(",", "")
-    elif "," in number:
-        if len(number.split(",")[-1]) == 2:
-            number = number.replace(",", ".")
-        else:
-            number = number.replace(",", "")
-    try:
-        return round(float(number), 2), symbol
-    except ValueError:
-        return None, None
+            db.touch_checked(product["id"])
+
+        polite_delay()
 
 
-def _is_blocked_page(soup: BeautifulSoup, status_code: int) -> bool:
-    if status_code in (503, 403):
-        return True
-    text = soup.get_text(" ", strip=True).lower()
-    return any(marker in text for marker in [
-        "type the characters you see",
-        "to discuss automated access to amazon data",
-        "enter the characters you see below",
-        "sorry, we just need to make sure you're not a robot",
-        "robot check",
-        "verify your identity",
-        "sign in for the best experience",
-    ])
+@app.route("/check-prices", methods=["GET", "POST"])
+def check_prices():
+    if not CRON_SECRET or request.args.get("token") != CRON_SECRET:
+        return jsonify(error="unauthorized"), 401
 
+    ensure_db()
+    products = db.get_all_products()
 
-def _extract_title_and_price(soup: BeautifulSoup):
-    """Return (title, price, currency) from a parsed Amazon page."""
-    title_el = None
-    for selector in TITLE_SELECTORS:
-        title_el = soup.select_one(selector)
-        if title_el:
-            break
-    title = title_el.get_text(strip=True) if title_el else None
+    if not products:
+        return jsonify(ok=True, message="No products tracked yet.", total=0)
 
-    price_value, currency = None, "$"
-    for selector in PRICE_SELECTORS:
-        price_el = soup.select_one(selector)
-        if price_el:
-            price_value, currency = _parse_price_text(price_el.get_text())
-            if price_value is not None:
-                break
+    # Return 200 immediately — Render's load balancer closes HTTP connections
+    # that don't get a response within ~30 seconds, and checking several
+    # products takes longer than that. The actual work runs in a background
+    # thread and sends Telegram messages when prices drop.
+    thread = threading.Thread(
+        target=_run_price_check,
+        args=(products,),
+        daemon=True,
+    )
+    thread.start()
 
-    return title, price_value, currency
-
-
-def _attempt_scrape(session: requests.Session, url: str, headers: dict,
-                    proxies: dict = None) -> dict:
-    """
-    Make one GET attempt and return parsed data, or raise AmazonFetchError.
-    Used by both the proxy and direct scraping paths.
-    """
-    kwargs = {"headers": headers, "timeout": REQUEST_TIMEOUT}
-    if proxies:
-        kwargs["proxies"] = proxies
-
-    try:
-        resp = session.get(url, **kwargs)
-    except requests.RequestException as exc:
-        raise AmazonFetchError(f"Network error: {exc}") from exc
-
-    if resp.status_code == 407:
-        raise AmazonFetchError(
-            "Apify proxy authentication failed — check APIFY_API_TOKEN."
-        )
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    if _is_blocked_page(soup, resp.status_code):
-        raise AmazonFetchError("Amazon blocked this request (CAPTCHA/rate limit).")
-
-    title, price_value, currency = _extract_title_and_price(soup)
-    if not title:
-        raise AmazonFetchError(
-            "Page loaded but no product title found — Amazon may be showing "
-            "a location prompt or this product isn't available in this region."
-        )
-
-    return {"title": title, "price": price_value, "currency": currency or "$"}
-
-
-def fetch_product_info(asin: str, domain: str = "amazon.com") -> dict:
-    """
-    Fetch current title and price for a product.
-    Returns {"title": str, "price": float|None, "currency": str, "url": str}.
-    Raises AmazonFetchError if all methods fail.
-    """
-    canonical_url = f"https://www.{domain}/dp/{asin}"
-    country_code = _domain_to_country_code(domain)
-
-    urls_to_try = [
-        canonical_url,
-        f"{canonical_url}?th=1&psc=1",
-    ]
-
-    # ── 1. Apify proxy (fast, ~5 seconds, bypasses IP blocking) ──────────────
-    apify_token = os.environ.get("APIFY_API_TOKEN", "").strip()
-    if apify_token:
-        # Route through a datacenter IP in the product's country so Amazon
-        # serves the correct regional page (important for amazon.ca etc.)
-        proxy_url = (
-            f"http://country-{country_code}:{apify_token}"
-            f"@{APIFY_PROXY_HOST}:{APIFY_PROXY_PORT}"
-        )
-        proxies = {"http": proxy_url, "https": proxy_url}
-        session = requests.Session()
-
-        for url in urls_to_try:
-            for headers in [HEADERS, MOBILE_HEADERS]:
-                try:
-                    data = _attempt_scrape(session, url, headers, proxies=proxies)
-                    return {**data, "url": canonical_url}
-                except AmazonFetchError:
-                    polite_delay(1)
-
-    # ── 2. Direct scraping (no proxy, last resort) ────────────────────────────
-    session = requests.Session()
-    for url in urls_to_try:
-        for headers in [HEADERS, MOBILE_HEADERS]:
-            try:
-                data = _attempt_scrape(session, url, headers)
-                return {**data, "url": canonical_url}
-            except AmazonFetchError:
-                polite_delay(1)
-
-    raise AmazonFetchError(
-        "Couldn't fetch this product after all attempts. "
-        "Amazon may be blocking requests from this server's IP. "
-        "Make sure APIFY_API_TOKEN is set in your Render environment."
+    return jsonify(
+        ok=True,
+        message=f"Price check started for {len(products)} product(s).",
+        total=len(products),
     )
 
 
-def polite_delay(seconds: float = 2.0):
-    """Small delay between consecutive Amazon requests in batch jobs."""
-    time.sleep(seconds)
+@app.get("/admin/apify-check")
+def admin_apify_check():
+    if not ADMIN_SECRET or request.args.get("token") != ADMIN_SECRET:
+        return jsonify(error="unauthorized"), 401
+
+    apify_token = os.environ.get("APIFY_API_TOKEN", "").strip()
+    if not apify_token:
+        return jsonify(ok=False, error="APIFY_API_TOKEN is not set in environment."), 400
+
+    # Test with a well-known, always-available product (Echo Dot on amazon.com).
+    test_asin = "B08N5WRWNW"
+    test_domain = "amazon.com"
+    try:
+        from bot.amazon import _fetch_via_apify
+        result = _fetch_via_apify(test_asin, test_domain, apify_token)
+        return jsonify(ok=True, result=result)
+    except Exception as exc:
+        return jsonify(ok=False, error=str(exc)), 500
+
+
+@app.get("/admin/db-check")
+def admin_db_check():
+    if not ADMIN_SECRET or request.args.get("token") != ADMIN_SECRET:
+        return jsonify(error="unauthorized"), 401
+
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        return jsonify(ok=True, message="Database connection succeeded.")
+    except Exception as exc:  # noqa: BLE001 — surface any DB error to the caller
+        return jsonify(ok=False, error=str(exc)), 500
+
+
+@app.get("/admin/set-webhook")
+def admin_set_webhook():
+    if not ADMIN_SECRET or request.args.get("token") != ADMIN_SECRET:
+        return jsonify(error="unauthorized"), 401
+
+    base_url = os.environ.get("RENDER_EXTERNAL_URL") or request.url_root.rstrip("/")
+    webhook_url = f"{base_url}/webhook"
+    webhook_result = telegram.set_webhook(webhook_url, TELEGRAM_WEBHOOK_SECRET)
+    commands_result = telegram.set_my_commands()
+    return jsonify(
+        webhook_url=webhook_url,
+        webhook=webhook_result,
+        commands=commands_result,
+    )
+
+
+@app.get("/admin/webhook-info")
+def admin_webhook_info():
+    if not ADMIN_SECRET or request.args.get("token") != ADMIN_SECRET:
+        return jsonify(error="unauthorized"), 401
+    return jsonify(telegram.get_webhook_info())
+
+
+if __name__ == "__main__":
+    # Local development only. In production, Render runs this with gunicorn
+    # (see the start command in render.yaml / README).
+    ensure_db()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=True)
