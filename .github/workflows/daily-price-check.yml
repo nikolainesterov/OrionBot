@@ -2,27 +2,37 @@ name: Daily Amazon price check
 
 on:
   schedule:
-    # Runs at 13:00 UTC every day (7:00 AM Saskatoon time).
-    # Edit minute/hour to change the time. Format: "minute hour * * *" in UTC.
+    # 13:00 UTC = 7:00 AM Saskatoon time (CST, no DST).
+    # Change "0 13" to "0 <hour_UTC>" to adjust.
     - cron: "0 13 * * *"
-  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
+  workflow_dispatch: {}
 
 jobs:
   check-prices:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Wake up the Render service
-        # Free Render services sleep after inactivity. This step pings the
-        # health endpoint and waits up to 90 seconds for it to wake up.
-        # We use || true so the job doesn't fail if the ping itself times out.
+      - name: Wake up Render and wait until it responds
+        # Render free services spin down after 15 min of no traffic.
+        # This step polls the health endpoint every 10 seconds until it
+        # gets a 200 response (meaning the container is fully awake),
+        # or gives up after 2 minutes.
         run: |
-          curl --silent --max-time 90 "${{ secrets.RENDER_APP_URL }}/" || true
-          sleep 5
+          echo "Waiting for Render to wake up..."
+          for i in $(seq 1 12); do
+            STATUS=$(curl --silent --max-time 10 --write-out "%{http_code}" \
+                         --output /dev/null "${{ secrets.RENDER_APP_URL }}/")
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              echo "Service is awake."
+              break
+            fi
+            sleep 10
+          done
 
-      - name: Trigger price check
-        # The /check-prices endpoint returns 200 immediately and runs the
-        # actual check in a background thread, so this step completes in
-        # under a second. Price drop alerts arrive via Telegram.
+      - name: Trigger daily price check
+        # /check-prices now returns 200 immediately (work runs in background).
+        # If this times out, the service isn't deployed correctly.
         run: |
-          curl --fail --show-error --max-time 30 \
+          curl --fail --show-error --max-time 15 \
             "${{ secrets.RENDER_APP_URL }}/check-prices?token=${{ secrets.CRON_SECRET }}"
