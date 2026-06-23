@@ -131,6 +131,20 @@ def _run_price_check(products):
                     f"{product['url']}"
                 ),
             )
+        elif (
+            new_price is not None
+            and old_price is not None
+            and float(new_price) > float(old_price)
+        ):
+            telegram.send_message(
+                product["chat_id"],
+                (
+                    f"📈 Price increase: <b>{info['title']}</b>\n"
+                    f"{info['currency']}{old_price} → "
+                    f"{info['currency']}{new_price}\n"
+                    f"{product['url']}"
+                ),
+            )
 
         if new_price is not None:
             db.update_price(product["id"], new_price)
