@@ -1,0 +1,15 @@
+name: Daily Amazon price check
+
+on:
+  schedule:
+    - cron: "0 13 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  check-prices:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the price-check endpoint
+        run: |
+          curl --fail --show-error --silent \
+            "${{ secrets.RENDER_APP_URL }}/check-prices?token=${{ secrets.CRON_SECRET }}"
