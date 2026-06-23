@@ -14,14 +14,16 @@ jobs:
     steps:
       - name: Wake up Render and wait until it responds
         # Render free services spin down after 15 min of no traffic.
-        # This step polls the health endpoint every 10 seconds until it
-        # gets a 200 response (meaning the container is fully awake),
-        # or gives up after 2 minutes.
+        # Polls every 10s until the health endpoint returns 200.
+        # The "|| true" on curl is required because bash -e (used by GitHub
+        # Actions) exits the script immediately on any non-zero exit code —
+        # including curl's exit code 28 (timeout). With "|| true", a timeout
+        # just means STATUS stays "000" and the loop retries.
         run: |
           echo "Waiting for Render to wake up..."
           for i in $(seq 1 12); do
             STATUS=$(curl --silent --max-time 10 --write-out "%{http_code}" \
-                         --output /dev/null "${{ secrets.RENDER_APP_URL }}/")
+                         --output /dev/null "${{ secrets.RENDER_APP_URL }}/") || true
             echo "Attempt $i: HTTP $STATUS"
             if [ "$STATUS" = "200" ]; then
               echo "Service is awake."
@@ -31,8 +33,8 @@ jobs:
           done
 
       - name: Trigger daily price check
-        # /check-prices now returns 200 immediately (work runs in background).
-        # If this times out, the service isn't deployed correctly.
+        # /check-prices returns 200 immediately (work runs in a background
+        # thread), so this should complete in well under 15 seconds.
         run: |
           curl --fail --show-error --max-time 15 \
             "${{ secrets.RENDER_APP_URL }}/check-prices?token=${{ secrets.CRON_SECRET }}"
